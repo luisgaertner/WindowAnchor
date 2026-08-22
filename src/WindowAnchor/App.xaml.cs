@@ -23,10 +23,32 @@ public partial class App : System.Windows.Application
     private StorageService?     _storageService;
     private SettingsService?    _settingsService;
     private HotkeyService?     _hotkeyService;
+    private CommandServer?     _commandServer;
 
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        // ── External command mode ─────────────────────────────────────────
+        // Invocations like `WindowAnchor.exe --align "MAIN"` are not meant to start a second
+        // instance: they hand the command to the instance already running in the tray and exit.
+        // This is what external launchers (Raycast, Stream Deck, shortcuts) call.
+        if (TryRunAsClient(e.Args))
+        {
+            Shutdown();
+            return;
+        }
+
+        // ── Single instance ───────────────────────────────────────────────
+        // WindowAnchor owns global hotkeys, a tray icon and the command pipe, none of which
+        // tolerate duplicates. Without this guard a stray launch (a shortcut, an unrecognised
+        // argument, autostart racing a manual start) silently adds another tray icon.
+        if (!AcquireSingleInstanceLock())
+        {
+            AppLogger.Info("Another instance is already running — exiting.");
+            Shutdown();
+            return;
+        }
 
         bool minimized = e.Args.Length > 0 &&
             e.Args[0].Equals("--minimized", StringComparison.OrdinalIgnoreCase);
@@ -56,6 +78,10 @@ public partial class App : System.Windows.Application
 
         _workspaceService = workspaceService;
         _coordinator      = new LayoutCoordinator(_monitorService, windowService, workspaceService);
+
+        // Accept commands from external launchers (see CommandServer and TryRunAsClient).
+        _commandServer = new CommandServer(workspaceService, _coordinator);
+        _commandServer.Start();
 
         // Hotkeys (settings were created above, before WindowService)
         _hotkeyService   = new HotkeyService();
@@ -290,9 +316,170 @@ public partial class App : System.Windows.Application
         _coordinator?.AlignAndMinimizeOthersAsync(snapshot);
     }
 
+    // ── Single-instance guard ────────────────────────────────────────────────
+
+    private static System.Threading.Mutex? _instanceMutex;
+
+    /// <summary>
+    /// Takes a per-user named mutex. Returns <c>false</c> when another instance already holds it,
+    /// in which case the caller must exit. The mutex is released automatically when the process
+    /// ends, including on a crash.
+    /// </summary>
+    private static bool AcquireSingleInstanceLock()
+    {
+        try
+        {
+            _instanceMutex = new System.Threading.Mutex(
+                initiallyOwned: true,
+                $"Local\\WindowAnchor.SingleInstance.{Environment.UserName}",
+                out bool createdNew);
+
+            return createdNew;
+        }
+        catch (Exception ex)
+        {
+            // Never let the guard itself stop the app from starting.
+            AppLogger.Warn($"Single-instance check failed, continuing: {ex.Message}");
+            return true;
+        }
+    }
+
+    // ── External command client ──────────────────────────────────────────────
+
+    /// <summary>Verbs accepted on the command line and forwarded to the running instance.</summary>
+    private static readonly string[] ClientVerbs = { "--restore", "--align", "--switch", "--save", "--list", "--ping" };
+
+    /// <summary>
+    /// When <paramref name="args"/> carries one of <see cref="ClientVerbs"/>, sends it to the
+    /// running instance over the command pipe and returns <c>true</c> so startup aborts.
+    /// Returns <c>false</c> for a normal launch.
+    /// <para>
+    /// The result is written to stdout, which a parent process that redirects the handle (a
+    /// Raycast extension, PowerShell) can read; the exit code is 0 on success and 1 on failure.
+    /// </para>
+    /// </summary>
+    private static bool TryRunAsClient(string[] args)
+    {
+        if (args.Length == 0) return false;
+
+        string verb = args[0].ToLowerInvariant();
+
+        // Anything switch-like other than --minimized is meant as a command. Unknown verbs are
+        // reported as an error instead of falling through to a normal launch, which would start
+        // a second tray instance and (with a startup workspace configured) restore a layout the
+        // caller never asked for.
+        bool looksLikeCommand = verb.StartsWith("--", StringComparison.Ordinal)
+                             && !verb.Equals("--minimized", StringComparison.OrdinalIgnoreCase);
+        if (!looksLikeCommand) return false;
+
+        EnsureConsoleOutput();
+
+        if (!ClientVerbs.Contains(verb))
+        {
+            Console.Out.WriteLine($"ERR|Unknown command '{verb}'. Supported: {string.Join(", ", ClientVerbs)}");
+            Console.Out.Flush();
+            Environment.ExitCode = 1;
+            return true;
+        }
+
+        // Pull recognised flags out before treating the remainder as the workspace name, so a
+        // name containing spaces still survives when the caller did not quote it.
+        var rest = args.Skip(1).ToList();
+        bool noFiles = rest.RemoveAll(a => a.Equals("--no-files", StringComparison.OrdinalIgnoreCase)) > 0;
+
+        string argument = string.Join(" ", rest);
+        string pipeVerb = verb.TrimStart('-');
+        if (pipeVerb == "save" && noFiles) pipeVerb = "savenofiles";
+
+        string message = $"{pipeVerb}|{argument}";
+
+        try
+        {
+            using var pipe = new System.IO.Pipes.NamedPipeClientStream(
+                ".", Services.CommandServer.PipeName, System.IO.Pipes.PipeDirection.InOut);
+
+            // Short timeout: either WindowAnchor is running and answers at once, or it is not.
+            pipe.Connect(3000);
+
+            using var writer = new System.IO.StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
+            using var reader = new System.IO.StreamReader(pipe, leaveOpen: true);
+
+            writer.WriteLine(message);
+            string reply = reader.ReadLine() ?? "ERR|No response";
+
+            Console.Out.WriteLine(reply.StartsWith("OK|", StringComparison.Ordinal)
+                ? reply[3..]
+                : reply);
+            Console.Out.Flush();
+
+            Environment.ExitCode = reply.StartsWith("ERR", StringComparison.Ordinal) ? 1 : 0;
+        }
+        catch (TimeoutException)
+        {
+            Console.Out.WriteLine("ERR|WindowAnchor is not running");
+            Console.Out.Flush();
+            Environment.ExitCode = 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Out.WriteLine($"ERR|{ex.Message}");
+            Console.Out.Flush();
+            Environment.ExitCode = 1;
+        }
+
+        return true;
+    }
+
+    // ── Console plumbing for command mode ────────────────────────────────────
+    // WindowAnchor is a WinExe, so it starts without a console and Console.Out goes nowhere.
+    // For --ping/--list to return anything we must bind stdout explicitly:
+    //   • launched from a terminal  → attach to the caller's console
+    //   • stdout redirected to a pipe (a Raycast extension, `... | Out-String`)
+    //     → the inherited handle is already usable and must NOT be replaced
+    // Both cases end with Console.Out pointing at a real stream.
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool AttachConsole(int dwProcessId);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern int GetFileType(IntPtr hFile);
+
+    private const int ATTACH_PARENT_PROCESS = -1;
+    private const int STD_OUTPUT_HANDLE     = -11;
+    private const int FILE_TYPE_UNKNOWN     = 0;
+
+    private static void EnsureConsoleOutput()
+    {
+        try
+        {
+            // A usable stdout handle means the caller redirected it — leave it alone,
+            // because AttachConsole would re-point the standard handles at the console.
+            IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            bool redirected = handle != IntPtr.Zero
+                           && handle != new IntPtr(-1)
+                           && GetFileType(handle) != FILE_TYPE_UNKNOWN;
+
+            if (!redirected)
+                AttachConsole(ATTACH_PARENT_PROCESS);   // no console to attach to → harmless
+
+            var stdout = Console.OpenStandardOutput();
+            var writer = new System.IO.StreamWriter(stdout) { AutoFlush = true };
+            Console.SetOut(writer);
+        }
+        catch
+        {
+            // Output is best effort: the command itself still runs and the exit code still
+            // reports success or failure, which is what a launcher actually needs.
+        }
+    }
+
     private void OnExitClick(object sender, RoutedEventArgs e)
     {
         AppLogger.Info("User requested exit.");
+        _commandServer?.Dispose();
         _hotkeyService?.Dispose();
         _trayIcon?.Dispose();
         Current.Shutdown();
