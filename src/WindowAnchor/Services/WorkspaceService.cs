@@ -995,6 +995,13 @@ public class WorkspaceService
             return string.Equals(e.AppUserModelId ?? "", liveAumid, StringComparison.OrdinalIgnoreCase);
         }
 
+        // Resolve groups of interchangeable windows up front (see BuildAmbiguousAssignments).
+        // Doing this before the loop matters: picking greedily per entry lets the first entry
+        // take a window that a later entry needed, which is how two TradingView charts ended up
+        // swapping monitors.
+        var preassigned = BuildAmbiguousAssignments(entries, liveWindows, restoredEntries,
+                                                    consumedHwnds, IdentityCompatible);
+
         for (int i = 0; i < entries.Count; i++)
         {
             if (restoredEntries.Contains(i)) continue;
@@ -1004,6 +1011,7 @@ public class WorkspaceService
 
             IntPtr bestHwnd = IntPtr.Zero;
             bool titleMatched = false;
+            bool fromGroup    = false;
 
             // ── Tier -1: web app match by AppUserModelID ──────────────────────────
             // A PWA's title changes with the page it shows, so the AUMID is the only stable
@@ -1067,44 +1075,15 @@ public class WorkspaceService
                 }
             }
 
-            // ── Tier 0.5: disambiguate multiple identical windows by title similarity ──
-            // Two windows of the same app (e.g. two TradingView charts, two Explorer windows)
-            // share the same exe, window class and — for packaged apps — the same AUMID, so the
-            // tiers below cannot tell them apart and may swap their positions. When more than one
-            // live window matches this entry's exe, pick the one whose current title is most
-            // similar to the saved title. TradingView puts the layout name at the end of the
-            // title ("… / 🦁LTF Luis" vs "… / 👀Outlook"), which is exactly what disambiguates
-            // them even though the price prefix keeps changing.
+            // ── Tier 0.5: interchangeable windows of the same app ─────────────────
+            // Resolved as a group before this loop; here we just take the result.
             if (bestHwnd == IntPtr.Zero)
             {
-                var sameExe = liveWindows
-                    .Where(kv => !consumedHwnds.Contains(kv.Key))
-                    .Where(kv => IdentityCompatible(entry, kv.Value.Record))
-                    .Where(kv => kv.Value.Record.ExecutablePath.Equals(
-                        entry.ExecutablePath, StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                if (sameExe.Count > 1)
+                if (preassigned.TryGetValue(i, out IntPtr assigned) &&
+                    !consumedHwnds.Contains(assigned))
                 {
-                    IntPtr bestByTitle = IntPtr.Zero;
-                    double bestScore   = -1;
-                    foreach (var kv in sameExe)
-                    {
-                        double score = TitleSimilarity(entry.Position.TitleSnippet,
-                                                       kv.Value.Record.TitleSnippet);
-                        if (score > bestScore)
-                        {
-                            bestScore   = score;
-                            bestByTitle = kv.Key;
-                        }
-                    }
-
-                    if (bestByTitle != IntPtr.Zero)
-                    {
-                        bestHwnd = bestByTitle;
-                        AppLogger.Info($"Disambiguated {entry.ProcessName} by title similarity " +
-                                       $"(score={bestScore:F2}) → hwnd {bestByTitle}");
-                    }
+                    bestHwnd  = assigned;
+                    fromGroup = true;
                 }
             }
 
@@ -1147,13 +1126,19 @@ public class WorkspaceService
             if (bestHwnd == IntPtr.Zero) continue;
 
             consumedHwnds.Add(bestHwnd);
-            restoredEntries.Add(i);
             matchedHwnds?.Add(bestHwnd);
             if (titleMatched) correctlyMatchedEntries?.Add(i);
             entry.WasRestored = true;
 
+            // A group assignment is a best guess from window titles, and during a startup restore
+            // those titles are often still generic while the app is loading. Such an entry is
+            // deliberately left out of restoredEntries so the later passes re-evaluate it once
+            // the real titles are in place; repositioning a window twice is harmless.
+            if (!fromGroup) restoredEntries.Add(i);
+
             _windowService.RestoreSingleWindow(bestHwnd, entry.Position);
-            AppLogger.Info($"Restored entry[{i}] {entry.ProcessName} → hwnd {bestHwnd} (titleMatched={titleMatched})");
+            AppLogger.Info($"Restored entry[{i}] {entry.ProcessName} → hwnd {bestHwnd} " +
+                           $"(titleMatched={titleMatched}, provisional={fromGroup})");
         }
     }
 
@@ -1206,6 +1191,159 @@ public class WorkspaceService
         }
 
         return 2.0 * overlap / ((a.Length - 1) + (b.Length - 1));
+    }
+
+    /// <summary>
+    /// Strips the parts of a window title that change on their own — digits and the punctuation
+    /// that surrounds a live quote. A TradingView title is mostly price
+    /// ("BTCUSDT.P ▲ 64.488,1 +0.23% / 🦁LTF Luis"), so comparing raw titles lets the volatile
+    /// majority drown out the layout name that actually identifies the window.
+    /// </summary>
+    private static string StripVolatileTitleParts(string title)
+    {
+        var sb = new System.Text.StringBuilder(title.Length);
+        foreach (char c in title)
+        {
+            if (char.IsDigit(c)) continue;
+            if (c is ',' or '.' or '+' or '-' or '%' or '▲' or '▼') continue;
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Length of the longest common suffix of two strings.</summary>
+    private static int CommonSuffixLength(string a, string b)
+    {
+        int n = 0;
+        while (n < a.Length && n < b.Length && a[a.Length - 1 - n] == b[b.Length - 1 - n]) n++;
+        return n;
+    }
+
+    /// <summary>
+    /// Similarity used to tell apart windows of the same application. Combines bigram overlap of
+    /// the de-noised titles with a shared-suffix bonus, because applications that keep several
+    /// windows open tend to put the distinguishing name at the end of the title.
+    /// </summary>
+    private static double WindowTitleAffinity(string saved, string live)
+    {
+        string a = StripVolatileTitleParts(saved ?? "").ToLowerInvariant().TrimEnd();
+        string b = StripVolatileTitleParts(live  ?? "").ToLowerInvariant().TrimEnd();
+
+        double dice = TitleSimilarity(a, b);
+
+        int shortest = Math.Min(a.Length, b.Length);
+        double suffix = shortest == 0 ? 0 : (double)CommonSuffixLength(a, b) / shortest;
+
+        return (0.55 * dice) + (0.45 * suffix);
+    }
+
+    /// <summary>
+    /// Resolves groups of windows that no other rule can tell apart — several windows of one
+    /// application, identical in executable, class and (for packaged apps) AppUserModelID.
+    ///
+    /// <para>Each such group is solved as a whole rather than entry by entry: every way of
+    /// pairing the group's entries with the available windows is scored with
+    /// <see cref="WindowTitleAffinity"/> and the best total wins. Choosing greedily per entry
+    /// lets an early entry take a window a later one needed, which is what made two TradingView
+    /// charts swap monitors.</para>
+    ///
+    /// <para>Entries that already have a reliable identity — web apps, dedicated browser windows
+    /// and open documents — are excluded, since exact rules match them elsewhere.</para>
+    /// </summary>
+    private static Dictionary<int, IntPtr> BuildAmbiguousAssignments(
+        List<WorkspaceEntry> entries,
+        Dictionary<IntPtr, (uint Pid, WindowRecord Record)> liveWindows,
+        HashSet<int> restoredEntries,
+        HashSet<IntPtr> consumedHwnds,
+        Func<WorkspaceEntry, WindowRecord, bool> identityCompatible)
+    {
+        var result = new Dictionary<int, IntPtr>();
+
+        var groups = Enumerable.Range(0, entries.Count)
+            .Where(i => !restoredEntries.Contains(i))
+            .Where(i => !string.IsNullOrEmpty(entries[i].ExecutablePath))
+            .Where(i => !entries[i].IsWebApp
+                     && !entries[i].IsDedicatedBrowserWindow
+                     && string.IsNullOrEmpty(entries[i].LaunchArg))
+            .GroupBy(i => entries[i].ExecutablePath, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1);
+
+        foreach (var group in groups)
+        {
+            var indices = group.ToList();
+
+            var candidates = liveWindows
+                .Where(kv => !consumedHwnds.Contains(kv.Key))
+                .Where(kv => kv.Value.Record.ExecutablePath.Equals(
+                    group.Key, StringComparison.OrdinalIgnoreCase))
+                .Where(kv => indices.Any(i => identityCompatible(entries[i], kv.Value.Record)))
+                .ToList();
+
+            if (candidates.Count < 2) continue;   // nothing to disentangle
+
+            // Guard against a combinatorial blow-up; beyond this the exact solution is not worth
+            // the cost and the ordinary tiers handle it well enough.
+            if (indices.Count > 7 || candidates.Count > 7) continue;
+
+            var scores = new double[indices.Count, candidates.Count];
+            for (int e = 0; e < indices.Count; e++)
+                for (int c = 0; c < candidates.Count; c++)
+                    scores[e, c] = identityCompatible(entries[indices[e]], candidates[c].Value.Record)
+                        ? WindowTitleAffinity(entries[indices[e]].Position.TitleSnippet,
+                                              candidates[c].Value.Record.TitleSnippet)
+                        : double.NegativeInfinity;
+
+            var best = new int[indices.Count];
+            var current = new int[indices.Count];
+            double bestTotal = double.NegativeInfinity;
+            Array.Fill(best, -1);
+
+            void Search(int e, double total, bool[] used)
+            {
+                if (e == indices.Count)
+                {
+                    if (total > bestTotal)
+                    {
+                        bestTotal = total;
+                        Array.Copy(current, best, current.Length);
+                    }
+                    return;
+                }
+
+                bool assignedAny = false;
+                for (int c = 0; c < candidates.Count; c++)
+                {
+                    if (used[c] || double.IsNegativeInfinity(scores[e, c])) continue;
+                    assignedAny = true;
+                    used[c] = true;
+                    current[e] = c;
+                    Search(e + 1, total + scores[e, c], used);
+                    used[c] = false;
+                }
+
+                // More entries than windows: leave this one unmatched and carry on.
+                if (!assignedAny)
+                {
+                    current[e] = -1;
+                    Search(e + 1, total, used);
+                }
+            }
+
+            Search(0, 0, new bool[candidates.Count]);
+
+            for (int e = 0; e < indices.Count; e++)
+            {
+                if (best[e] < 0) continue;
+                var chosen = candidates[best[e]];
+                result[indices[e]] = chosen.Key;
+
+                AppLogger.Info(
+                    $"Grouped {entries[indices[e]].ProcessName} entry[{indices[e]}] → hwnd {chosen.Key} " +
+                    $"(affinity={scores[e, best[e]]:F2}, \"{chosen.Value.Record.TitleSnippet}\")");
+            }
+        }
+
+        return result;
     }
 
     /// <summary>
