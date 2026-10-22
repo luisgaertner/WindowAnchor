@@ -2,6 +2,21 @@
 
 **WindowAnchor** is a modern, Fluent-designed window management utility for Windows 11. It allows you to capture your entire workspace — including window positions, sizes, and even open files — and restore them with a single click or automatically when your monitor configuration changes.
 
+> **About this fork** — WindowAnchor was created by [marvintrvl](https://github.com/marvintrvl/WindowAnchor).
+> This fork by [Luis Gaertner](https://github.com/luisgaertner) adds the features listed below.
+> Most of them were merged back into the original project via
+> [pull request #4](https://github.com/marvintrvl/WindowAnchor/pull/4) (marked *merged upstream*).
+
+## What this fork adds
+
+- **Web apps and Store apps are restored as themselves** *(merged upstream)* — Installed browser web apps (PWAs) and Microsoft Store apps are identified by their `AppUserModelID` instead of just executable and window class. Restoring a layout reopens the actual app instead of a blank browser window.
+- **Friendly names and correct launching** *(merged upstream)* — The save dialog shows web apps by their real name, and Store apps are launched through their package identity.
+- **Dedicated browser windows restored by URL** *(merged upstream)* — Websites kept in their own browser window (e.g. trading tools without a PWA manifest) can be reopened at their exact URL. The address is read via UI Automation; this is opt-in through URL patterns in the settings.
+- **Smarter matching of identical windows** — Several windows of the same app (e.g. two TradingView charts) are assigned as a group by title similarity, ignoring volatile parts like live prices, so they no longer swap monitors on restore.
+- **Bulk delete** *(merged upstream)* — Select several saved workspaces (or all of them) and delete them in one go.
+- **Command interface for automation** — Launchers like Raycast, Stream Deck or AutoHotkey can save, restore and switch workspaces through a named pipe. A single-instance guard hands commands to the running instance instead of starting a second one.
+- **More robust settings parsing** *(merged upstream)*.
+
 [![VirusTotal](https://img.shields.io/badge/VirusTotal-0%2F70%20clean-success)](https://www.virustotal.com/gui/file/b758f3e749e9884e6be18d0d62f4ac0bd6061f56560c3816be0f950abe6cd9ba/detection)
 
 <!-- [IMAGE: Main Settings Window showcasing modern Fluent UI] -->
